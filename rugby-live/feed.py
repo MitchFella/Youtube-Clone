@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
-"""Live feeder for the Nations Championship Live+ page.
+"""Live feeder for the Nations Live Centre page.
 
-Polls the rugby365 match-centre feed (Opta data) and writes one compact JSON
-document per match into --out. It exits as soon as something worth pushing has
-changed, printing which match ids to write to the page's database
-(collection "matches", doc id = match id). Run it again after pushing.
+Polls the rugby365 match-centre feed (Opta data) every 10 s, cross-checks the
+status against ESPN's scoreboard, and writes one compact JSON document per match
+into live/. It exits as soon as something worth pushing has changed and prints
+one PUSH line per changed match with exactly what to write to the page's
+database, then a NEXT line with the command to run again:
 
-  feed.py --data data.json --out live --ids 604003            # live loop
-  feed.py --data data.json --out live --ids 604002 --once     # one snapshot
+  PUSH collection=matches doc_id=604004 if_version=3 file_path=/.../live/604004.json | LIVE 12-7 38' score/status
+  NEXT python3 /.../feed.py --ids 604004
+
+The script cannot write to the page's database itself; a small relay session
+does that (RELAY.md). Scores, cards and half/full time exit at once; commentary
+and stats-only changes at most every --minor-gap seconds. If rugby365 fails, the
+scoreline carries on from ESPN alone.
+
+  feed.py --ids 604004                                  # live loop, one match
+  feed.py --ids 604005,604006 --ver 604005:0,604006:0   # two at once, new documents
+  feed.py --ids 604003 --once                           # one snapshot
+  feed.py --sim 5                                       # relay self-test, no network
 """
 import argparse, hashlib, json, os, re, sys, time, urllib.parse, urllib.request
 from datetime import datetime, timezone
@@ -188,17 +199,111 @@ def sig_minor(d):
     return hashlib.md5(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
 
+def espn_only(match, ev, prev):
+    """Second source. ESPN's scoreboard carries score, clock and status on its own,
+    so when the rugby365 feed fails the scoreline keeps moving. Timeline, stats and
+    commentary are kept from the last good rugby365 document."""
+    try:
+        by = {c.get("homeAway"): c for c in ev["competitions"][0].get("competitors", [])}
+        home, away = by["home"], by["away"]
+    except Exception:
+        return None
+    nm = lambda c: (c["team"].get("displayName") or "").strip().lower()
+    if nm(home) != match["_home_name"].lower() and nm(away) == match["_home_name"].lower():
+        home, away = away, home
+    st = ev.get("status") or {}
+    typ = st.get("type") or {}
+    name, state = (typ.get("name") or "").upper(), typ.get("state")
+    status = "NS"
+    if state == "post":
+        status = "FT"
+    elif "HALFTIME" in name or "HALF_TIME" in name:
+        status = "HT"
+    elif state == "in":
+        status = "LIVE"
+    doc = dict(prev or {"id": match["id"], "min": 0, "per": 1, "events": [], "sg": [], "flow": [],
+                        "comm": [], "pst": {}, "pens": [], "lineups": {"h": [], "a": []}})
+    doc["status"], doc["at"] = status, now_iso()
+    if status in ("LIVE", "HT"):
+        doc["per"] = max(int(st.get("period") or 1), 1)
+        doc["min"] = minute(st.get("displayClock")) or int(float(st.get("clock") or 0) // 60) or doc.get("min") or 0
+    elif status == "FT":
+        doc["per"], doc["min"] = 2, max(80, doc.get("min") or 0)
+    num = lambda v: int(v) if str(v if v is not None else "").strip().isdigit() else None
+    hs, as_ = num(home.get("score")), num(away.get("score"))
+    if status != "NS" and hs is not None and as_ is not None:
+        doc["hs"], doc["as"] = hs, as_
+    raw = dict(doc.get("raw") or {})
+    raw.update({"src": "espn-only", "espn": typ.get("name")})
+    doc["raw"] = raw
+    return doc
+
+
+def dump(obj, path, **kw):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, **kw)
+    os.replace(tmp, path)
+
+
+def push_line(coll, mid, ver, path, note):
+    """One line the relay copies into an ArtifactData set. ver: None unknown, 0 no document yet."""
+    v = "unknown" if ver is None else ("none" if ver == 0 else str(ver))
+    print("PUSH collection=%s doc_id=%s if_version=%s file_path=%s | %s" % (coll, mid, v, path, note))
+
+
+def simulate(a, st, save, again):
+    """Relay self-test: N fake updates to collection 'selftest', no network. The third one
+    carries a deliberately wrong version so the version-conflict recovery gets exercised."""
+    n = st.get("sim", 0)
+    if n >= a.sim:
+        print("DONE self-test finished after %d updates" % n)
+        return 0
+    time.sleep(8)
+    n += 1
+    path = os.path.join(a.out, "selftest-t1.json")
+    dump({"id": "t1", "n": n, "of": a.sim, "status": "LIVE", "hs": 7 * n, "as": 3 * (n // 2), "min": 9 * n,
+          "at": now_iso(), "note": "relay self-test"}, path)
+    v = st["ver"].get("t1", 0)
+    push_line("selftest", "t1", v + 5 if n == 3 else v, path, "self-test update %d of %d" % (n, a.sim))
+    st["ver"]["t1"] = (v + 5 if n == 3 else v) + 1
+    st["sim"] = n
+    save()
+    print(again)
+    return 0
+
+
 def main():
+    here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--ids", required=True)
+    ap.add_argument("--data", default=os.path.join(here, "data.json"))
+    ap.add_argument("--out", default=os.path.join(here, "live"))
+    ap.add_argument("--ids", default="")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--poll", type=float, default=10)
-    ap.add_argument("--minor-gap", type=float, default=75, help="seconds between pushes for commentary/stats-only changes")
+    ap.add_argument("--minor-gap", type=float, default=90,
+                    help="least seconds between exits caused only by commentary/stats changes (all matches together)")
     ap.add_argument("--heartbeat", type=float, default=300)
-    ap.add_argument("--max-secs", type=float, default=6600)
+    ap.add_argument("--max-secs", type=float, default=540)
+    ap.add_argument("--ver", default="",
+                    help="document versions now in the database, e.g. 604004:3,604005:0 (0 = no document yet)")
+    ap.add_argument("--sim", type=int, default=0, help="relay self-test with N fake updates, no network")
     a = ap.parse_args()
+
+    os.makedirs(a.out, exist_ok=True)
+    state_path = os.path.join(a.out, ".state.json")
+    st = json.load(open(state_path)) if os.path.exists(state_path) else {}
+    st.setdefault("m", {})
+    st.setdefault("ver", {})
+    for part in filter(None, a.ver.split(",")):
+        k, _, v = part.partition(":")
+        st["ver"][k.strip()] = int(v)
+    save = lambda: dump(st, state_path)
+    again = "NEXT python3 %s%s%s%s" % (os.path.abspath(__file__), " --ids " + a.ids if a.ids else "",
+                                       " --minor-gap %g" % a.minor_gap if a.minor_gap != 90 else "",
+                                       " --sim %d" % a.sim if a.sim else "")
+    if a.sim:
+        return simulate(a, st, save, again)
 
     base = json.load(open(a.data))
     matches = {}
@@ -210,60 +315,86 @@ def main():
             matches[m["id"]] = mm
     if not matches:
         print("NO_MATCHES"); return 2
-    os.makedirs(a.out, exist_ok=True)
-    state_path = os.path.join(a.out, ".pushed.json")
-    pushed = json.load(open(state_path)) if os.path.exists(state_path) else {}
-    start, errs = time.time(), 0
+    days = {m["ko"][:10].replace("-", "") for m in matches.values()}
+    pm, ver = st["m"], st["ver"]
+    start, espn, espn_t, errs, blank = time.time(), {}, 0, {}, 0
 
     while True:
-        espn = {}
-        try:
-            days = {m["ko"][:10].replace("-", "") for m in matches.values()}
-            for d in days:
-                for e in http(ESPN % d, timeout=12).get("events", []):
-                    espn[e["id"]] = e.get("status")
-        except Exception:
-            pass
-        todo, all_done = [], True
-        for mid, m in matches.items():
+        now = time.time()
+        if now - espn_t >= 30:  # ESPN scoreboard: status cross-check and second score source
             try:
-                j = http(m["_url"], {"action": "update", "comments": 0, "events": 0})
-                doc = transform(m, j, espn.get(mid))
-                errs = 0
+                fresh = {}
+                for d in days:
+                    for e in http(ESPN % d, timeout=12).get("events", []):
+                        fresh[e["id"]] = e
+                espn, espn_t = fresh, now
+            except Exception:
+                pass
+        docs = {}
+        for mid, m in matches.items():
+            path = os.path.join(a.out, mid + ".json")
+            ev = espn.get(mid)
+            try:
+                doc = transform(m, http(m["_url"], {"action": "update", "comments": 0, "events": 0}),
+                                (ev or {}).get("status"))
+                errs[mid] = 0
             except Exception as ex:
-                errs += 1
-                print("ERR", mid, repr(ex)[:200], file=sys.stderr)
-                all_done = False
-                continue
-            json.dump(doc, open(os.path.join(a.out, mid + ".json"), "w"), ensure_ascii=False, separators=(",", ":"))
-            p = pushed.get(mid) or {}
-            major, minor, t = sig_major(doc), sig_minor(doc), time.time()
+                errs[mid] = errs.get(mid, 0) + 1
+                if errs[mid] in (1, 10):
+                    print("ERR", mid, repr(ex)[:160], file=sys.stderr)
+                doc = None
+                if ev and errs[mid] >= 2:
+                    try:
+                        prev = json.load(open(path)) if os.path.exists(path) else None
+                    except Exception:
+                        prev = None
+                    doc = espn_only(m, ev, prev)
+                if doc is None:
+                    continue
+            dump(doc, path, ensure_ascii=False, separators=(",", ":"))
+            docs[mid] = doc
+        blank = 0 if docs else blank + 1
+
+        now = time.time()
+        gap_ok = now - st.get("t", 0) >= a.minor_gap
+        pend, go, all_done = [], False, len(docs) == len(matches)
+        for mid, doc in docs.items():
+            p = pm.get(mid) or {}
+            major, minor = sig_major(doc), sig_minor(doc)
             reason = None
             if a.once or not p:
                 reason = "first"
             elif major != p.get("major"):
                 reason = "score/status"
-            elif minor != p.get("minor") and t - p.get("t", 0) >= a.minor_gap:
+            elif minor != p.get("minor"):
                 reason = "detail"
-            elif doc["status"] in ("LIVE", "HT") and t - p.get("t", 0) >= a.heartbeat:
+            elif doc["status"] in ("LIVE", "HT") and now - p.get("t", 0) >= a.heartbeat:
                 reason = "heartbeat"
             if reason:
-                todo.append((mid, reason, doc))
-                pushed[mid] = {"major": major, "minor": minor, "t": t, "status": doc["status"]}
+                pend.append((mid, reason, doc, major, minor))
+                go = go or reason != "detail" or gap_ok
             if doc["status"] != "FT" or reason:
                 all_done = False
-        if todo:
-            json.dump(pushed, open(state_path, "w"))
-            for mid, reason, doc in todo:
-                print("PUSH %s reason=%s status=%s %s-%s min=%s per=%s raw=%s" % (mid, reason, doc["status"], doc.get("hs"), doc.get("as"), doc.get("min"), doc.get("per"), json.dumps(doc["raw"])))
+        if go:
+            for mid, reason, doc, major, minor in pend:
+                pm[mid] = {"major": major, "minor": minor, "t": now, "status": doc["status"]}
+                push_line("matches", mid, ver.get(mid), os.path.join(a.out, mid + ".json"),
+                          "%s %s-%s %s' %s%s" % (doc["status"], doc.get("hs"), doc.get("as"), doc.get("min"), reason,
+                                                 " (espn only)" if (doc.get("raw") or {}).get("src") == "espn-only" else ""))
+                if ver.get(mid) is not None:
+                    ver[mid] += 1
+            st["t"] = now
+            save()
+            if not a.once:
+                print(again)
             return 0
         if all_done:
             print("DONE all matches finished and pushed"); return 0
-        if errs >= 30:
-            print("FEED_ERRORS giving up after repeated fetch errors"); return 3
+        if blank >= 30:
+            print("FEED_ERRORS no data from either source for 30 polls"); print(again); return 3
         if time.time() - start > a.max_secs:
-            print("TIMEOUT nothing new; run again"); return 0
-        live = any((pushed.get(i) or {}).get("status") in ("LIVE", "HT") for i in matches)
+            print("TIMEOUT nothing new"); print(again); return 0
+        live = any((pm.get(i) or {}).get("status") in ("LIVE", "HT") for i in matches)
         soon = any(abs(time.time() - datetime.fromisoformat(m["ko"].replace("Z", "+00:00")).timestamp()) < 900 for m in matches.values())
         time.sleep(a.poll if (live or soon) else 45)
 
