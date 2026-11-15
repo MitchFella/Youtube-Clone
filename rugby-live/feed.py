@@ -287,6 +287,8 @@ def main():
     ap.add_argument("--max-secs", type=float, default=540)
     ap.add_argument("--ver", default="",
                     help="document versions now in the database, e.g. 604004:3,604005:0 (0 = no document yet)")
+    ap.add_argument("--init-ver", default="",
+                    help="like --ver, but only for documents this checkout has no version for yet (safe to repeat on a restart)")
     ap.add_argument("--sim", type=int, default=0, help="relay self-test with N fake updates, no network")
     a = ap.parse_args()
 
@@ -295,9 +297,11 @@ def main():
     st = json.load(open(state_path)) if os.path.exists(state_path) else {}
     st.setdefault("m", {})
     st.setdefault("ver", {})
-    for part in filter(None, a.ver.split(",")):
-        k, _, v = part.partition(":")
-        st["ver"][k.strip()] = int(v)
+    for arg, force in ((a.init_ver, False), (a.ver, True)):
+        for part in filter(None, arg.split(",")):
+            k, _, v = part.partition(":")
+            if force or k.strip() not in st["ver"]:
+                st["ver"][k.strip()] = int(v)
     save = lambda: dump(st, state_path)
     again = "NEXT python3 %s%s%s%s" % (os.path.abspath(__file__), " --ids " + a.ids if a.ids else "",
                                        " --minor-gap %g" % a.minor_gap if a.minor_gap != 90 else "",
@@ -318,6 +322,8 @@ def main():
     days = {m["ko"][:10].replace("-", "") for m in matches.values()}
     pm, ver = st["m"], st["ver"]
     start, espn, espn_t, errs, blank = time.time(), {}, 0, {}, 0
+    ko = {i: datetime.fromisoformat(m["ko"].replace("Z", "+00:00")).timestamp() for i, m in matches.items()}
+    docs, due = {}, {i: 0 for i in matches}
 
     while True:
         now = time.time()
@@ -330,8 +336,11 @@ def main():
                 espn, espn_t = fresh, now
             except Exception:
                 pass
-        docs = {}
+        tried = got = 0
         for mid, m in matches.items():
+            if now < due[mid]:
+                continue
+            tried += 1
             path = os.path.join(a.out, mid + ".json")
             ev = espn.get(mid)
             try:
@@ -353,7 +362,14 @@ def main():
                     continue
             dump(doc, path, ensure_ascii=False, separators=(",", ":"))
             docs[mid] = doc
-        blank = 0 if docs else blank + 1
+            got += 1
+            # Poll only what can change soon: finished-and-pushed matches and
+            # matches far from kick-off are looked at every few minutes.
+            if doc["status"] == "FT" and (pm.get(mid) or {}).get("status") == "FT":
+                due[mid] = now + 300
+            elif doc["status"] == "NS" and ko[mid] - now > 1200:
+                due[mid] = now + 120
+        blank = blank + 1 if (tried and not got) else 0
 
         now = time.time()
         gap_ok = now - st.get("t", 0) >= a.minor_gap
@@ -390,6 +406,8 @@ def main():
             return 0
         if all_done:
             print("DONE all matches finished and pushed"); return 0
+        if now > max(ko.values()) + 4 * 3600:
+            print("DONE match window is over (last kick-off was more than 4 hours ago)"); return 0
         if blank >= 30:
             print("FEED_ERRORS no data from either source for 30 polls"); print(again); return 3
         if time.time() - start > a.max_secs:
